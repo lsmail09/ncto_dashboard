@@ -5,7 +5,7 @@ const config: CapacitorConfig = {
   appName: 'NCTO Dashboard',
   webDir: 'www',
   server: {
-    url: 'https://dashboard.ncto.gov.ng',
+    url: 'https://ncto-dashboard.onrender.com',
     cleartext: false
   },
   ios: {
