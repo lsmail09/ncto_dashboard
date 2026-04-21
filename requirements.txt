@@ -1,0 +1,6 @@
+dash
+pandas
+sqlalchemy
+psycopg2-binary
+waitress
+python-dotenv
