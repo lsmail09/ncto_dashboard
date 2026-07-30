@@ -111,6 +111,35 @@ def qtable(schema: str, table: str) -> str:
     return f"{pg_ident(schema)}.{pg_ident(table)}"
 
 
+
+def amount_numeric_sql(column_name: str) -> str:
+    """
+    Return a PostgreSQL expression that safely converts a numeric or text
+    amount column to NUMERIC(18,2).
+
+    Handles:
+    - native numeric values
+    - text values such as 25000, 25,000, ₦25,000.00
+    - NULL and blank strings
+    - malformed values, which become 0
+    """
+    column = pg_ident(column_name)
+    cleaned = (
+        f"REGEXP_REPLACE("
+        f"TRIM(CAST({column} AS TEXT)), "
+        f"'[^0-9.\\-]', '', 'g'"
+        f")"
+    )
+
+    return (
+        "CASE "
+        f"WHEN {column} IS NULL THEN CAST(0 AS NUMERIC(18,2)) "
+        f"WHEN {cleaned} ~ '^-?[0-9]+(\\.[0-9]+)?$' "
+        f"THEN CAST({cleaned} AS NUMERIC(18,2)) "
+        "ELSE CAST(0 AS NUMERIC(18,2)) "
+        "END"
+    )
+
 def build_engine():
     if not PASSWORD:
         raise RuntimeError("Database password not set. Set BEN_DB_PASSWORD first.")
@@ -264,7 +293,7 @@ def build_union_summary_sql(group_cols: list[str], filters: list[str]) -> str:
         SELECT
             {first_select_cols},
             COUNT(*) AS "FirstTrancheCount",
-            SUM(CAST(COALESCE({pg_ident(FIRST_AMOUNT_COL)}, 0) AS NUMERIC(18,2))) AS "FirstTrancheAmount",
+            SUM({amount_numeric_sql(FIRST_AMOUNT_COL)}) AS "FirstTrancheAmount",
             0 AS "SecondTrancheCount",
             CAST(0 AS NUMERIC(18,2)) AS "SecondTrancheAmount",
             0 AS "ThirdTrancheCount",
@@ -282,7 +311,7 @@ def build_union_summary_sql(group_cols: list[str], filters: list[str]) -> str:
             0 AS "FirstTrancheCount",
             CAST(0 AS NUMERIC(18,2)) AS "FirstTrancheAmount",
             COUNT(*) AS "SecondTrancheCount",
-            SUM(CAST(COALESCE({pg_ident(SECOND_AMOUNT_COL)}, 0) AS NUMERIC(18,2))) AS "SecondTrancheAmount",
+            SUM({amount_numeric_sql(SECOND_AMOUNT_COL)}) AS "SecondTrancheAmount",
             0 AS "ThirdTrancheCount",
             CAST(0 AS NUMERIC(18,2)) AS "ThirdTrancheAmount"
         FROM {second_table}
@@ -300,7 +329,7 @@ def build_union_summary_sql(group_cols: list[str], filters: list[str]) -> str:
             0 AS "SecondTrancheCount",
             CAST(0 AS NUMERIC(18,2)) AS "SecondTrancheAmount",
             COUNT(*) AS "ThirdTrancheCount",
-            SUM(CAST(COALESCE({pg_ident(THIRD_AMOUNT_COL)}, 0) AS NUMERIC(18,2))) AS "ThirdTrancheAmount"
+            SUM({amount_numeric_sql(THIRD_AMOUNT_COL)}) AS "ThirdTrancheAmount"
         FROM {third_table}
         WHERE {pg_ident(THIRD_STATE_COL)} IS NOT NULL
           AND TRIM({pg_ident(THIRD_STATE_COL)}) <> ''
@@ -342,7 +371,7 @@ def build_beneficiary_cte_sql(first_where: str, second_where: str, third_where: 
             CAST({c(FIRST_ACCOUNT_NUMBER_COL)} AS TEXT) AS "FirstTrancheAccountNumber",
             CAST({c(FIRST_BANK_NAME_COL)} AS TEXT) AS "FirstTrancheBankName",
             CAST({c(FIRST_PAYMENT_DATE_COL)} AS TEXT) AS "FirstTranchePaymentDate",
-            CAST(COALESCE({c(FIRST_AMOUNT_COL)}, 0) AS NUMERIC(18,2)) AS "FirstTrancheAmount"
+            {amount_numeric_sql(FIRST_AMOUNT_COL)} AS "FirstTrancheAmount"
         FROM {first_table}
         WHERE {first_where}
     ),
@@ -363,7 +392,7 @@ def build_beneficiary_cte_sql(first_where: str, second_where: str, third_where: 
             CAST({c(SECOND_ACCOUNT_NUMBER_COL)} AS TEXT) AS "SecondTrancheAccountNumber",
             CAST({c(SECOND_BANK_NAME_COL)} AS TEXT) AS "SecondTrancheBankName",
             CAST({c(SECOND_PAYMENT_DATE_COL)} AS TEXT) AS "SecondTranchePaymentDate",
-            CAST(COALESCE({c(SECOND_AMOUNT_COL)}, 0) AS NUMERIC(18,2)) AS "SecondTrancheAmount"
+            {amount_numeric_sql(SECOND_AMOUNT_COL)} AS "SecondTrancheAmount"
         FROM {second_table}
         WHERE {second_where}
     ),
@@ -384,7 +413,7 @@ def build_beneficiary_cte_sql(first_where: str, second_where: str, third_where: 
             CAST({c(THIRD_ACCOUNT_NUMBER_COL)} AS TEXT) AS "ThirdTrancheAccountNumber",
             CAST({c(THIRD_BANK_NAME_COL)} AS TEXT) AS "ThirdTrancheBankName",
             CAST({c(THIRD_PAYMENT_DATE_COL)} AS TEXT) AS "ThirdTranchePaymentDate",
-            CAST(COALESCE({c(THIRD_AMOUNT_COL)}, 0) AS NUMERIC(18,2)) AS "ThirdTrancheAmount"
+            {amount_numeric_sql(THIRD_AMOUNT_COL)} AS "ThirdTrancheAmount"
         FROM {third_table}
         WHERE {third_where}
     ),
