@@ -160,6 +160,71 @@ def build_engine():
 engine = build_engine()
 
 
+def resolve_table_name(schema_name: str, configured_name: str) -> str:
+    """
+    Resolve a PostgreSQL table name using the actual catalog spelling.
+
+    PostgreSQL folds unquoted names to lowercase, while quoted names are
+    case-sensitive. This allows configured names such as
+    itblDistinctSecondTranche to match catalog names such as
+    itbldistinctsecondtranche or other capitalization variants.
+    """
+    sql = text("""
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE lower(table_schema) = lower(:schema_name)
+          AND lower(table_name) = lower(:table_name)
+        ORDER BY
+            CASE WHEN table_schema = :schema_name THEN 0 ELSE 1 END,
+            CASE WHEN table_name = :table_name THEN 0 ELSE 1 END
+        LIMIT 1
+    """)
+
+    with engine.connect() as conn:
+        actual_name = conn.execute(
+            sql,
+            {"schema_name": schema_name, "table_name": configured_name},
+        ).scalar_one_or_none()
+
+    if actual_name:
+        return actual_name
+
+    similar_sql = text("""
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE lower(table_schema) = lower(:schema_name)
+          AND (
+              lower(table_name) LIKE lower(:contains_name)
+              OR lower(table_name) LIKE '%tranche%'
+              OR lower(table_name) LIKE '%beneficiar%'
+          )
+        ORDER BY table_name
+        LIMIT 30
+    """)
+
+    with engine.connect() as conn:
+        similar = conn.execute(
+            similar_sql,
+            {
+                "schema_name": schema_name,
+                "contains_name": f"%{configured_name}%",
+            },
+        ).scalars().all()
+
+    raise RuntimeError(
+        f"Table {schema_name}.{configured_name} was not found. "
+        f"Available similar tables: {', '.join(similar) if similar else 'none found'}"
+    )
+
+
+# Resolve table names once at startup using PostgreSQL catalog spelling.
+FIRST_TABLE = resolve_table_name(SCHEMA, FIRST_TABLE)
+SECOND_TABLE = resolve_table_name(SCHEMA, SECOND_TABLE)
+THIRD_TABLE = resolve_table_name(SCHEMA, THIRD_TABLE)
+
+print(f"Resolved tables: {SCHEMA}.{FIRST_TABLE}, {SCHEMA}.{SECOND_TABLE}, {SCHEMA}.{THIRD_TABLE}")
+
+
 # =========================================================
 # HELPERS
 # =========================================================
