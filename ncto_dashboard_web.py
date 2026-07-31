@@ -283,127 +283,266 @@ def make_error_panel(title: str, exc: Exception):
 # SQL BUILDERS - SUMMARY
 # =========================================================
 
-def build_union_summary_sql(group_cols: list[str], filters: list[str]) -> str:
-    if not group_cols:
-        raise ValueError("group_cols cannot be empty")
+def build_consolidated_summary_sql(
+    group_cols: list[str],
+    filters: list[str],
+) -> str:
+    """
+    Executive summary source:
+        ben."itblDistinctPaidBeneficiaries"
 
-    first_table = qtable(SCHEMA, FIRST_TABLE)
-    second_table = qtable(SCHEMA, SECOND_TABLE)
-    third_table = qtable(SCHEMA, THIRD_TABLE)
+    Tranche progression:
+        First
+        FirstSecond
+        FirstSecondThird
+    """
 
-    def select_cols_expr(group_cols_, state_col, lga_col, ward_col, community_col):
-        parts = []
-        for logical_col in group_cols_:
-            physical = get_physical_col(logical_col, state_col, lga_col, ward_col, community_col)
-            parts.append(f"TRIM({pg_ident(physical)}) AS {pg_ident(logical_col)}")
-        return ",\n            ".join(parts)
+    table_name = qtable(SCHEMA, FIRST_TABLE)
 
-    def group_by_cols_expr(group_cols_, state_col, lga_col, ward_col, community_col):
-        parts = []
-        for logical_col in group_cols_:
-            physical = get_physical_col(logical_col, state_col, lga_col, ward_col, community_col)
-            parts.append(f"TRIM({pg_ident(physical)})")
-        return ", ".join(parts)
+    group_select = ""
+    group_by = ""
+    order_by = ""
 
-    def outer_select_cols(cols):
-        return ",\n        ".join([f'x.{pg_ident(c)}' for c in cols])
+    if group_cols:
+        group_select = ",\n        ".join(
+            f'TRIM({pg_ident(col)}) AS {pg_ident(col)}'
+            for col in group_cols
+        )
 
-    def outer_group_by_cols(cols):
-        return ", ".join([f'x.{pg_ident(c)}' for c in cols])
+        group_by = ", ".join(
+            f'TRIM({pg_ident(col)})'
+            for col in group_cols
+        )
 
-    def order_by_cols_expr(cols):
-        return ", ".join([f'x.{pg_ident(c)} ASC' for c in cols])
+        order_by = ", ".join(
+            f'{pg_ident(col)} ASC'
+            for col in group_cols
+        )
 
-    def build_filter_sql(filters_, state_col, lga_col, ward_col, community_col):
-        if not filters_:
-            return ""
+    where_conditions = [
+        f'{pg_ident(FIRST_STATE_COL)} IS NOT NULL',
+        f"TRIM({pg_ident(FIRST_STATE_COL)}) <> ''",
+    ]
 
-        replaced = []
-        for expr in filters_:
-            x = expr.replace("[State]", pg_ident(state_col))
-            x = x.replace("[Lga]", pg_ident(lga_col))
-            x = x.replace("[Ward]", pg_ident(ward_col))
-            x = x.replace("[Community]", pg_ident(community_col))
-            replaced.append(x)
+    where_conditions.extend(filters)
 
-        return "\n          AND " + "\n          AND ".join(replaced)
+    where_sql = "\n      AND ".join(where_conditions)
 
-    outer_select = outer_select_cols(group_cols)
-    outer_group_by = outer_group_by_cols(group_cols)
-    order_by_cols = order_by_cols_expr(group_cols)
+    amount_expression = f"""
+        CASE
+            WHEN {pg_ident(FIRST_AMOUNT_COL)} IS NULL
+                THEN CAST(0 AS NUMERIC(18,2))
 
-    first_select_cols = select_cols_expr(group_cols, FIRST_STATE_COL, FIRST_LGA_COL, FIRST_WARD_COL, FIRST_COMMUNITY_COL)
-    second_select_cols = select_cols_expr(group_cols, SECOND_STATE_COL, SECOND_LGA_COL, SECOND_WARD_COL, SECOND_COMMUNITY_COL)
-    third_select_cols = select_cols_expr(group_cols, THIRD_STATE_COL, THIRD_LGA_COL, THIRD_WARD_COL, THIRD_COMMUNITY_COL)
+            WHEN REGEXP_REPLACE(
+                    TRIM(CAST({pg_ident(FIRST_AMOUNT_COL)} AS TEXT)),
+                    '[^0-9.\\-]',
+                    '',
+                    'g'
+                 ) ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                THEN CAST(
+                    REGEXP_REPLACE(
+                        TRIM(CAST({pg_ident(FIRST_AMOUNT_COL)} AS TEXT)),
+                        '[^0-9.\\-]',
+                        '',
+                        'g'
+                    )
+                    AS NUMERIC(18,2)
+                )
 
-    first_group_by = group_by_cols_expr(group_cols, FIRST_STATE_COL, FIRST_LGA_COL, FIRST_WARD_COL, FIRST_COMMUNITY_COL)
-    second_group_by = group_by_cols_expr(group_cols, SECOND_STATE_COL, SECOND_LGA_COL, SECOND_WARD_COL, SECOND_COMMUNITY_COL)
-    third_group_by = group_by_cols_expr(group_cols, THIRD_STATE_COL, THIRD_LGA_COL, THIRD_WARD_COL, THIRD_COMMUNITY_COL)
+            ELSE CAST(0 AS NUMERIC(18,2))
+        END
+    """
 
-    first_filter_sql = build_filter_sql(filters, FIRST_STATE_COL, FIRST_LGA_COL, FIRST_WARD_COL, FIRST_COMMUNITY_COL)
-    second_filter_sql = build_filter_sql(filters, SECOND_STATE_COL, SECOND_LGA_COL, SECOND_WARD_COL, SECOND_COMMUNITY_COL)
-    third_filter_sql = build_filter_sql(filters, THIRD_STATE_COL, THIRD_LGA_COL, THIRD_WARD_COL, THIRD_COMMUNITY_COL)
+    prefix = f"{group_select}," if group_select else ""
+
+    group_clause = f"GROUP BY {group_by}" if group_by else ""
+    order_clause = f"ORDER BY {order_by}" if order_by else ""
 
     return f"""
     SELECT
-        {outer_select},
-        SUM(x."FirstTrancheCount") AS "FirstTrancheCount",
-        SUM(x."FirstTrancheAmount") AS "FirstTrancheAmount",
-        SUM(x."SecondTrancheCount") AS "SecondTrancheCount",
-        SUM(x."SecondTrancheAmount") AS "SecondTrancheAmount",
-        SUM(x."ThirdTrancheCount") AS "ThirdTrancheCount",
-        SUM(x."ThirdTrancheAmount") AS "ThirdTrancheAmount",
-        SUM(x."FirstTrancheAmount" + x."SecondTrancheAmount" + x."ThirdTrancheAmount") AS "TotalAmount"
-    FROM (
-        SELECT
-            {first_select_cols},
-            COUNT(*) AS "FirstTrancheCount",
-            SUM({amount_numeric_sql(FIRST_AMOUNT_COL)}) AS "FirstTrancheAmount",
-            0 AS "SecondTrancheCount",
-            CAST(0 AS NUMERIC(18,2)) AS "SecondTrancheAmount",
-            0 AS "ThirdTrancheCount",
-            CAST(0 AS NUMERIC(18,2)) AS "ThirdTrancheAmount"
-        FROM {first_table}
-        WHERE {pg_ident(FIRST_STATE_COL)} IS NOT NULL
-          AND TRIM({pg_ident(FIRST_STATE_COL)}) <> ''
-          {first_filter_sql}
-        GROUP BY {first_group_by}
+        {prefix}
 
-        UNION ALL
+        COUNT(*) FILTER (
+            WHERE TRIM({pg_ident("TrancheStatus")}) IN (
+                'First',
+                'FirstSecond',
+                'FirstSecondThird'
+            )
+        ) AS "FirstTrancheCount",
 
-        SELECT
-            {second_select_cols},
-            0 AS "FirstTrancheCount",
-            CAST(0 AS NUMERIC(18,2)) AS "FirstTrancheAmount",
-            COUNT(*) AS "SecondTrancheCount",
-            SUM({amount_numeric_sql(SECOND_AMOUNT_COL)}) AS "SecondTrancheAmount",
-            0 AS "ThirdTrancheCount",
-            CAST(0 AS NUMERIC(18,2)) AS "ThirdTrancheAmount"
-        FROM {second_table}
-        WHERE {pg_ident(SECOND_STATE_COL)} IS NOT NULL
-          AND TRIM({pg_ident(SECOND_STATE_COL)}) <> ''
-          {second_filter_sql}
-        GROUP BY {second_group_by}
+        SUM(
+            CASE
+                WHEN TRIM({pg_ident("TrancheStatus")}) IN (
+                    'First',
+                    'FirstSecond',
+                    'FirstSecondThird'
+                )
+                THEN {amount_expression}
+                ELSE CAST(0 AS NUMERIC(18,2))
+            END
+        ) AS "FirstTrancheAmount",
 
-        UNION ALL
+        COUNT(*) FILTER (
+            WHERE TRIM({pg_ident("TrancheStatus")}) IN (
+                'FirstSecond',
+                'FirstSecondThird'
+            )
+        ) AS "SecondTrancheCount",
 
-        SELECT
-            {third_select_cols},
-            0 AS "FirstTrancheCount",
-            CAST(0 AS NUMERIC(18,2)) AS "FirstTrancheAmount",
-            0 AS "SecondTrancheCount",
-            CAST(0 AS NUMERIC(18,2)) AS "SecondTrancheAmount",
-            COUNT(*) AS "ThirdTrancheCount",
-            SUM({amount_numeric_sql(THIRD_AMOUNT_COL)}) AS "ThirdTrancheAmount"
-        FROM {third_table}
-        WHERE {pg_ident(THIRD_STATE_COL)} IS NOT NULL
-          AND TRIM({pg_ident(THIRD_STATE_COL)}) <> ''
-          {third_filter_sql}
-        GROUP BY {third_group_by}
-    ) x
-    GROUP BY {outer_group_by}
-    ORDER BY {order_by_cols};
+        SUM(
+            CASE
+                WHEN TRIM({pg_ident("TrancheStatus")}) IN (
+                    'FirstSecond',
+                    'FirstSecondThird'
+                )
+                THEN {amount_expression}
+                ELSE CAST(0 AS NUMERIC(18,2))
+            END
+        ) AS "SecondTrancheAmount",
+
+        COUNT(*) FILTER (
+            WHERE TRIM({pg_ident("TrancheStatus")}) = 'FirstSecondThird'
+        ) AS "ThirdTrancheCount",
+
+        SUM(
+            CASE
+                WHEN TRIM({pg_ident("TrancheStatus")}) = 'FirstSecondThird'
+                THEN {amount_expression}
+                ELSE CAST(0 AS NUMERIC(18,2))
+            END
+        ) AS "ThirdTrancheAmount",
+
+        SUM({amount_expression}) AS "TotalAmount"
+
+    FROM {table_name}
+
+    WHERE {where_sql}
+
+    {group_clause}
+    {order_clause};
     """
+
+# def build_union_summary_sql(group_cols: list[str], filters: list[str]) -> str:
+#     if not group_cols:
+#         raise ValueError("group_cols cannot be empty")
+#
+#     first_table = qtable(SCHEMA, FIRST_TABLE)
+#     second_table = qtable(SCHEMA, SECOND_TABLE)
+#     third_table = qtable(SCHEMA, THIRD_TABLE)
+#
+#     def select_cols_expr(group_cols_, state_col, lga_col, ward_col, community_col):
+#         parts = []
+#         for logical_col in group_cols_:
+#             physical = get_physical_col(logical_col, state_col, lga_col, ward_col, community_col)
+#             parts.append(f"TRIM({pg_ident(physical)}) AS {pg_ident(logical_col)}")
+#         return ",\n            ".join(parts)
+#
+#     def group_by_cols_expr(group_cols_, state_col, lga_col, ward_col, community_col):
+#         parts = []
+#         for logical_col in group_cols_:
+#             physical = get_physical_col(logical_col, state_col, lga_col, ward_col, community_col)
+#             parts.append(f"TRIM({pg_ident(physical)})")
+#         return ", ".join(parts)
+#
+#     def outer_select_cols(cols):
+#         return ",\n        ".join([f'x.{pg_ident(c)}' for c in cols])
+#
+#     def outer_group_by_cols(cols):
+#         return ", ".join([f'x.{pg_ident(c)}' for c in cols])
+#
+#     def order_by_cols_expr(cols):
+#         return ", ".join([f'x.{pg_ident(c)} ASC' for c in cols])
+#
+#     def build_filter_sql(filters_, state_col, lga_col, ward_col, community_col):
+#         if not filters_:
+#             return ""
+#
+#         replaced = []
+#         for expr in filters_:
+#             x = expr.replace("[State]", pg_ident(state_col))
+#             x = x.replace("[Lga]", pg_ident(lga_col))
+#             x = x.replace("[Ward]", pg_ident(ward_col))
+#             x = x.replace("[Community]", pg_ident(community_col))
+#             replaced.append(x)
+#
+#         return "\n          AND " + "\n          AND ".join(replaced)
+#
+#     outer_select = outer_select_cols(group_cols)
+#     outer_group_by = outer_group_by_cols(group_cols)
+#     order_by_cols = order_by_cols_expr(group_cols)
+#
+#     first_select_cols = select_cols_expr(group_cols, FIRST_STATE_COL, FIRST_LGA_COL, FIRST_WARD_COL, FIRST_COMMUNITY_COL)
+#     second_select_cols = select_cols_expr(group_cols, SECOND_STATE_COL, SECOND_LGA_COL, SECOND_WARD_COL, SECOND_COMMUNITY_COL)
+#     third_select_cols = select_cols_expr(group_cols, THIRD_STATE_COL, THIRD_LGA_COL, THIRD_WARD_COL, THIRD_COMMUNITY_COL)
+#
+#     first_group_by = group_by_cols_expr(group_cols, FIRST_STATE_COL, FIRST_LGA_COL, FIRST_WARD_COL, FIRST_COMMUNITY_COL)
+#     second_group_by = group_by_cols_expr(group_cols, SECOND_STATE_COL, SECOND_LGA_COL, SECOND_WARD_COL, SECOND_COMMUNITY_COL)
+#     third_group_by = group_by_cols_expr(group_cols, THIRD_STATE_COL, THIRD_LGA_COL, THIRD_WARD_COL, THIRD_COMMUNITY_COL)
+#
+#     first_filter_sql = build_filter_sql(filters, FIRST_STATE_COL, FIRST_LGA_COL, FIRST_WARD_COL, FIRST_COMMUNITY_COL)
+#     second_filter_sql = build_filter_sql(filters, SECOND_STATE_COL, SECOND_LGA_COL, SECOND_WARD_COL, SECOND_COMMUNITY_COL)
+#     third_filter_sql = build_filter_sql(filters, THIRD_STATE_COL, THIRD_LGA_COL, THIRD_WARD_COL, THIRD_COMMUNITY_COL)
+#
+#     return f"""
+#     SELECT
+#         {outer_select},
+#         SUM(x."FirstTrancheCount") AS "FirstTrancheCount",
+#         SUM(x."FirstTrancheAmount") AS "FirstTrancheAmount",
+#         SUM(x."SecondTrancheCount") AS "SecondTrancheCount",
+#         SUM(x."SecondTrancheAmount") AS "SecondTrancheAmount",
+#         SUM(x."ThirdTrancheCount") AS "ThirdTrancheCount",
+#         SUM(x."ThirdTrancheAmount") AS "ThirdTrancheAmount",
+#         SUM(x."FirstTrancheAmount" + x."SecondTrancheAmount" + x."ThirdTrancheAmount") AS "TotalAmount"
+#     FROM (
+#         SELECT
+#             {first_select_cols},
+#             COUNT(*) AS "FirstTrancheCount",
+#             SUM({amount_numeric_sql(FIRST_AMOUNT_COL)}) AS "FirstTrancheAmount",
+#             0 AS "SecondTrancheCount",
+#             CAST(0 AS NUMERIC(18,2)) AS "SecondTrancheAmount",
+#             0 AS "ThirdTrancheCount",
+#             CAST(0 AS NUMERIC(18,2)) AS "ThirdTrancheAmount"
+#         FROM {first_table}
+#         WHERE {pg_ident(FIRST_STATE_COL)} IS NOT NULL
+#           AND TRIM({pg_ident(FIRST_STATE_COL)}) <> ''
+#           {first_filter_sql}
+#         GROUP BY {first_group_by}
+#
+#         UNION ALL
+#
+#         SELECT
+#             {second_select_cols},
+#             0 AS "FirstTrancheCount",
+#             CAST(0 AS NUMERIC(18,2)) AS "FirstTrancheAmount",
+#             COUNT(*) AS "SecondTrancheCount",
+#             SUM({amount_numeric_sql(SECOND_AMOUNT_COL)}) AS "SecondTrancheAmount",
+#             0 AS "ThirdTrancheCount",
+#             CAST(0 AS NUMERIC(18,2)) AS "ThirdTrancheAmount"
+#         FROM {second_table}
+#         WHERE {pg_ident(SECOND_STATE_COL)} IS NOT NULL
+#           AND TRIM({pg_ident(SECOND_STATE_COL)}) <> ''
+#           {second_filter_sql}
+#         GROUP BY {second_group_by}
+#
+#         UNION ALL
+#
+#         SELECT
+#             {third_select_cols},
+#             0 AS "FirstTrancheCount",
+#             CAST(0 AS NUMERIC(18,2)) AS "FirstTrancheAmount",
+#             0 AS "SecondTrancheCount",
+#             CAST(0 AS NUMERIC(18,2)) AS "SecondTrancheAmount",
+#             COUNT(*) AS "ThirdTrancheCount",
+#             SUM({amount_numeric_sql(THIRD_AMOUNT_COL)}) AS "ThirdTrancheAmount"
+#         FROM {third_table}
+#         WHERE {pg_ident(THIRD_STATE_COL)} IS NOT NULL
+#           AND TRIM({pg_ident(THIRD_STATE_COL)}) <> ''
+#           {third_filter_sql}
+#         GROUP BY {third_group_by}
+#     ) x
+#     GROUP BY {outer_group_by}
+#     ORDER BY {order_by_cols};
+#     """
 
 
 # =========================================================
@@ -567,40 +706,106 @@ def build_beneficiary_search_sql(mode: str) -> str:
 # DATA ACCESS
 # =========================================================
 
+# def fetch_state_summary() -> pd.DataFrame:
+#     return read_sql_df(build_union_summary_sql(["State"], []))
+#
+#
+# def fetch_lga_summary(state_name: str) -> pd.DataFrame:
+#     return read_sql_df(
+#         build_union_summary_sql(["State", "Lga"], ["TRIM([State]) = TRIM(:state)"]),
+#         params={"state": state_name},
+#     )
+#
+#
+# def fetch_ward_summary(state_name: str, lga_name: str) -> pd.DataFrame:
+#     return read_sql_df(
+#         build_union_summary_sql(
+#             ["State", "Lga", "Ward"],
+#             ["TRIM([State]) = TRIM(:state)", "TRIM([Lga]) = TRIM(:lga)"],
+#         ),
+#         params={"state": state_name, "lga": lga_name},
+#     )
+#
+#
+# def fetch_community_summary(state_name: str, lga_name: str, ward_name: str) -> pd.DataFrame:
+#     return read_sql_df(
+#         build_union_summary_sql(
+#             ["State", "Lga", "Ward", "Community"],
+#             [
+#                 "TRIM([State]) = TRIM(:state)",
+#                 "TRIM([Lga]) = TRIM(:lga)",
+#                 "TRIM([Ward]) = TRIM(:ward)",
+#             ],
+#         ),
+#         params={"state": state_name, "lga": lga_name, "ward": ward_name},
+#     )
+
+
 def fetch_state_summary() -> pd.DataFrame:
-    return read_sql_df(build_union_summary_sql(["State"], []))
+    return read_sql_df(
+        build_consolidated_summary_sql(
+            group_cols=["State"],
+            filters=[],
+        )
+    )
 
 
 def fetch_lga_summary(state_name: str) -> pd.DataFrame:
     return read_sql_df(
-        build_union_summary_sql(["State", "Lga"], ["TRIM([State]) = TRIM(:state)"]),
-        params={"state": state_name},
-    )
-
-
-def fetch_ward_summary(state_name: str, lga_name: str) -> pd.DataFrame:
-    return read_sql_df(
-        build_union_summary_sql(
-            ["State", "Lga", "Ward"],
-            ["TRIM([State]) = TRIM(:state)", "TRIM([Lga]) = TRIM(:lga)"],
-        ),
-        params={"state": state_name, "lga": lga_name},
-    )
-
-
-def fetch_community_summary(state_name: str, lga_name: str, ward_name: str) -> pd.DataFrame:
-    return read_sql_df(
-        build_union_summary_sql(
-            ["State", "Lga", "Ward", "Community"],
-            [
-                "TRIM([State]) = TRIM(:state)",
-                "TRIM([Lga]) = TRIM(:lga)",
-                "TRIM([Ward]) = TRIM(:ward)",
+        build_consolidated_summary_sql(
+            group_cols=["State", "LGA"],
+            filters=[
+                'TRIM("State") = TRIM(:state)'
             ],
         ),
-        params={"state": state_name, "lga": lga_name, "ward": ward_name},
-    )
+        params={"state": state_name},
+    ).rename(columns={"LGA": "Lga"})
 
+
+def fetch_ward_summary(
+    state_name: str,
+    lga_name: str,
+) -> pd.DataFrame:
+    return read_sql_df(
+        build_consolidated_summary_sql(
+            group_cols=["State", "LGA", "Ward"],
+            filters=[
+                'TRIM("State") = TRIM(:state)',
+                'TRIM("LGA") = TRIM(:lga)',
+            ],
+        ),
+        params={
+            "state": state_name,
+            "lga": lga_name,
+        },
+    ).rename(columns={"LGA": "Lga"})
+
+
+def fetch_community_summary(
+    state_name: str,
+    lga_name: str,
+    ward_name: str,
+) -> pd.DataFrame:
+    return read_sql_df(
+        build_consolidated_summary_sql(
+            group_cols=[
+                "State",
+                "LGA",
+                "Ward",
+                "Community",
+            ],
+            filters=[
+                'TRIM("State") = TRIM(:state)',
+                'TRIM("LGA") = TRIM(:lga)',
+                'TRIM("Ward") = TRIM(:ward)',
+            ],
+        ),
+        params={
+            "state": state_name,
+            "lga": lga_name,
+            "ward": ward_name,
+        },
+    ).rename(columns={"LGA": "Lga"})
 
 def fetch_beneficiary_details(state_name: str, lga_name: str, ward_name: str, community_name: str) -> pd.DataFrame:
     return read_sql_df(
