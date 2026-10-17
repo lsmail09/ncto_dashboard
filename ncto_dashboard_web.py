@@ -21,7 +21,7 @@ SERVER = os.getenv("DB_HOST", "102.164.37.69")
 PORT_DB = int(os.getenv("DB_PORT", "5432"))
 DATABASE = os.getenv("DB_NAME", "ben_db")
 USER = os.getenv("DB_USER", "ben_user")
-PASSWORD = os.getenv("BEN_DB_PASSWORD", "")
+PASSWORD = os.getenv("BEN_DB_PASSWORD", "Olajumokepsgr#9#9")
 SCHEMA = os.getenv("DB_SCHEMA", "ben")
 
 APP_TITLE = os.getenv("APP_TITLE", "Executive Dashboard")
