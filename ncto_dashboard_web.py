@@ -21,7 +21,7 @@ SERVER = os.getenv("DB_HOST", "102.164.37.69")
 PORT_DB = int(os.getenv("DB_PORT", "5432"))
 DATABASE = os.getenv("DB_NAME", "ben_db")
 USER = os.getenv("DB_USER", "ben_user")
-PASSWORD = os.getenv("BEN_DB_PASSWORD", "Olajumokepsgr#9#9")
+PASSWORD = os.getenv("BEN_DB_PASSWORD", "")
 SCHEMA = os.getenv("DB_SCHEMA", "ben")
 
 APP_TITLE = os.getenv("APP_TITLE", "Executive Dashboard")
@@ -293,6 +293,75 @@ def make_error_panel(title: str, exc: Exception):
 # SQL BUILDERS - SUMMARY
 # =========================================================
 
+# =========================================================
+# REPORT-ONLY GEOGRAPHIC CANONICALIZATION
+# =========================================================
+from pathlib import Path
+import csv
+from functools import lru_cache
+
+GEO_ALIASES_FILE = Path(__file__).with_name("geo_reporting_aliases.csv")
+
+
+def _geo_basic(col: str) -> str:
+    return ("UPPER(BTRIM(REGEXP_REPLACE("
+            f"REPLACE(REPLACE(REPLACE(REPLACE(COALESCE({col}::text, ''), '-', ' '), '_', ' '), '/', ' '), CHR(92), ' '), "
+            "'[[:space:]]+', ' ', 'g')))" )
+
+
+def _sql_literal(value: str) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+@lru_cache(maxsize=1)
+def load_geo_aliases():
+    rows = []
+    if not GEO_ALIASES_FILE.exists():
+        return rows
+    with GEO_ALIASES_FILE.open(encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            if row.get("decision", "APPROVE").strip().upper() != "APPROVE":
+                continue
+            level = row.get("level", "").strip().upper()
+            if level not in ("LGA", "WARD", "COMMUNITY"):
+                continue
+            state = row.get("state", "").strip().upper()
+            old = row.get("old_name", "").strip().upper()
+            new = row.get("new_name", "").strip().upper()
+            if not (state and old and new):
+                continue
+            rows.append((level, state, row.get("lga", "").strip().upper(),
+                         row.get("ward", "").strip().upper(), old, new))
+    return rows
+
+
+def report_geo_expr(level: str, aliases=None) -> str:
+    aliases = load_geo_aliases() if aliases is None else aliases
+    physical = {"State": FIRST_STATE_COL, "Lga": FIRST_LGA_COL,
+                "Ward": FIRST_WARD_COL, "Community": FIRST_COMMUNITY_COL}
+    raw = _geo_basic(pg_ident(physical[level]))
+    if level == "State":
+        return raw
+    state = _geo_basic(pg_ident(FIRST_STATE_COL))
+    lga = _geo_basic(pg_ident(FIRST_LGA_COL))
+    ward = _geo_basic(pg_ident(FIRST_WARD_COL))
+    clauses = []
+    for kind, st, parent_lga, parent_ward, old, new in aliases:
+        if kind != level.upper() or (level == "Lga" and kind != "LGA"):
+            continue
+        if level == "Ward" and not parent_lga:
+            continue
+        if level == "Community" and not (parent_lga and parent_ward):
+            continue
+        cond = f"{state} = {_sql_literal(st)} AND {raw} = {_sql_literal(old)}"
+        if level in ("Ward", "Community"):
+            cond += f" AND {lga} = {_sql_literal(parent_lga)}"
+        if level == "Community":
+            cond += f" AND {ward} = {_sql_literal(parent_ward)}"
+        clauses.append(f"WHEN {cond} THEN {_sql_literal(new)}")
+    return "(CASE " + " ".join(clauses) + f" ELSE {raw} END)" if clauses else raw
+
+
 def build_union_summary_sql(group_cols: list[str], filters: list[str]) -> str:
     """
     Build executive summary from the canonical payment summary table only.
@@ -316,50 +385,17 @@ def build_union_summary_sql(group_cols: list[str], filters: list[str]) -> str:
         "Community": FIRST_COMMUNITY_COL,
     }
 
-    # All-state normalization. Alias corrections are scoped to State and level.
-    # Add verified aliases for ANY state using GEO_ALIASES_JSON environment variable.
-    # Example: {"KANO": {"Lga": {"GARUM MALLAM": "GARUN MALLAM"}}}
-    default_aliases = {
-        "KANO": {"Lga": {
-            "GARUM MALLAM": "GARUN MALLAM",
-            "GARUN MALAM": "GARUN MALLAM",
-            "NASARAWA KANO": "NASARAWA",
-            "NASSARAWA": "NASARAWA",
-            "TUNDUN WADA": "TUDUN WADA",
-            "UNGOGGO": "UNGOGO",
-        }}
-    }
-    try:
-        extra_aliases = json.loads(os.getenv("GEO_ALIASES_JSON", "{}"))
-        for state, levels in extra_aliases.items():
-            for level, mappings in levels.items():
-                default_aliases.setdefault(state.upper(), {}).setdefault(level, {}).update(mappings)
-    except (ValueError, TypeError) as exc:
-        raise ValueError("Invalid GEO_ALIASES_JSON configuration") from exc
+    # Report-only aliases, loaded from a bundled, reviewed CSV.
+    # Never write to source tables. All aliases are scoped by full hierarchy.
+    aliases = load_geo_aliases()
 
     def basic_expr(col):
         return ("UPPER(BTRIM(REGEXP_REPLACE("
                 f"REPLACE(REPLACE(REPLACE(REPLACE(COALESCE({col}::text, ''), '-', ' '), '_', ' '), '/', ' '), CHR(92), ' '), "
                 "'[[:space:]]+', ' ', 'g')))" )
 
-    state_expr = basic_expr(pg_ident(FIRST_STATE_COL))
-
     def geo_expr(logical):
-        col = pg_ident(logical_to_physical[logical])
-        basic = basic_expr(col)
-        if logical == "State":
-            return basic
-        cases = []
-        for state, levels in sorted(default_aliases.items()):
-            for variant, canonical in sorted(levels.get(logical, {}).items()):
-                # Escape literal single quotes for SQL safety.
-                st = state.upper().replace("'", "''")
-                old = variant.upper().replace("'", "''")
-                new = canonical.upper().replace("'", "''")
-                cases.append(f"WHEN {state_expr} = '{st}' AND {basic} = '{old}' THEN '{new}'")
-        if not cases:
-            return basic
-        return "(CASE " + " ".join(cases) + f" ELSE {basic} END)"
+        return report_geo_expr(logical, aliases)
 
     select_parts = []
     group_parts = []
@@ -580,10 +616,25 @@ def build_beneficiary_cte_sql(first_where: str, second_where: str, third_where: 
 
 
 def build_beneficiary_detail_sql() -> str:
+    # Use the same canonical names as the summary drill-down.
+    # The three source tables have the same geographic column names by default.
+    def where_for(state_col, lga_col, ward_col, community_col):
+        expressions = [report_geo_expr("State"), report_geo_expr("Lga"),
+                       report_geo_expr("Ward"), report_geo_expr("Community")]
+        # Bind expression to the corresponding tranche-table physical names.
+        for i, (source, target) in enumerate(zip(
+            [FIRST_STATE_COL, FIRST_LGA_COL, FIRST_WARD_COL, FIRST_COMMUNITY_COL],
+            [state_col, lga_col, ward_col, community_col]
+        )):
+            if source != target:
+                expressions = [e.replace(pg_ident(source), pg_ident(target)) for e in expressions]
+        return " AND ".join(f"{expr} = UPPER(TRIM(:{param}))" for expr, param in
+                            zip(expressions, ("state", "lga", "ward", "community")))
+
     return build_beneficiary_cte_sql(
-        'TRIM("State") = TRIM(:state) AND TRIM("LGA") = TRIM(:lga) AND TRIM("Ward") = TRIM(:ward) AND TRIM("Community") = TRIM(:community)',
-        'TRIM("State") = TRIM(:state) AND TRIM("LGA") = TRIM(:lga) AND TRIM("Ward") = TRIM(:ward) AND TRIM("Community") = TRIM(:community)',
-        'TRIM("State") = TRIM(:state) AND TRIM("LGA") = TRIM(:lga) AND TRIM("Ward") = TRIM(:ward) AND TRIM("Community") = TRIM(:community)',
+        where_for(FIRST_STATE_COL, FIRST_LGA_COL, FIRST_WARD_COL, FIRST_COMMUNITY_COL),
+        where_for(SECOND_STATE_COL, SECOND_LGA_COL, SECOND_WARD_COL, SECOND_COMMUNITY_COL),
+        where_for(THIRD_STATE_COL, THIRD_LGA_COL, THIRD_WARD_COL, THIRD_COMMUNITY_COL),
     )
 
 
