@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from urllib.parse import urlencode, parse_qs, quote_plus
 
 import pandas as pd
@@ -315,16 +316,59 @@ def build_union_summary_sql(group_cols: list[str], filters: list[str]) -> str:
         "Community": FIRST_COMMUNITY_COL,
     }
 
+    # All-state normalization. Alias corrections are scoped to State and level.
+    # Add verified aliases for ANY state using GEO_ALIASES_JSON environment variable.
+    # Example: {"KANO": {"Lga": {"GARUM MALLAM": "GARUN MALLAM"}}}
+    default_aliases = {
+        "KANO": {"Lga": {
+            "GARUM MALLAM": "GARUN MALLAM",
+            "GARUN MALAM": "GARUN MALLAM",
+            "NASARAWA KANO": "NASARAWA",
+            "NASSARAWA": "NASARAWA",
+            "TUNDUN WADA": "TUDUN WADA",
+            "UNGOGGO": "UNGOGO",
+        }}
+    }
+    try:
+        extra_aliases = json.loads(os.getenv("GEO_ALIASES_JSON", "{}"))
+        for state, levels in extra_aliases.items():
+            for level, mappings in levels.items():
+                default_aliases.setdefault(state.upper(), {}).setdefault(level, {}).update(mappings)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("Invalid GEO_ALIASES_JSON configuration") from exc
+
+    def basic_expr(col):
+        return ("UPPER(BTRIM(REGEXP_REPLACE("
+                f"REPLACE(REPLACE(REPLACE(REPLACE(COALESCE({col}::text, ''), '-', ' '), '_', ' '), '/', ' '), CHR(92), ' '), "
+                "'[[:space:]]+', ' ', 'g')))" )
+
+    state_expr = basic_expr(pg_ident(FIRST_STATE_COL))
+
+    def geo_expr(logical):
+        col = pg_ident(logical_to_physical[logical])
+        basic = basic_expr(col)
+        if logical == "State":
+            return basic
+        cases = []
+        for state, levels in sorted(default_aliases.items()):
+            for variant, canonical in sorted(levels.get(logical, {}).items()):
+                # Escape literal single quotes for SQL safety.
+                st = state.upper().replace("'", "''")
+                old = variant.upper().replace("'", "''")
+                new = canonical.upper().replace("'", "''")
+                cases.append(f"WHEN {state_expr} = '{st}' AND {basic} = '{old}' THEN '{new}'")
+        if not cases:
+            return basic
+        return "(CASE " + " ".join(cases) + f" ELSE {basic} END)"
+
     select_parts = []
     group_parts = []
     order_parts = []
 
     for logical_col in group_cols:
         physical_col = logical_to_physical[logical_col]
-        select_parts.append(
-            f"TRIM(CAST({pg_ident(physical_col)} AS TEXT)) AS {pg_ident(logical_col)}"
-        )
-        group_parts.append(f"TRIM(CAST({pg_ident(physical_col)} AS TEXT))")
+        select_parts.append(f"{geo_expr(logical_col)} AS {pg_ident(logical_col)}")
+        group_parts.append(geo_expr(logical_col))
         order_parts.append(f'{pg_ident(logical_col)} ASC')
 
     select_sql = ",\n        ".join(select_parts)
@@ -338,10 +382,8 @@ def build_union_summary_sql(group_cols: list[str], filters: list[str]) -> str:
 
     for expression in filters:
         resolved = expression
-        resolved = resolved.replace("[State]", pg_ident(FIRST_STATE_COL))
-        resolved = resolved.replace("[Lga]", pg_ident(FIRST_LGA_COL))
-        resolved = resolved.replace("[Ward]", pg_ident(FIRST_WARD_COL))
-        resolved = resolved.replace("[Community]", pg_ident(FIRST_COMMUNITY_COL))
+        for logical in ("State", "Lga", "Ward", "Community"):
+            resolved = resolved.replace(f"[{logical}]", geo_expr(logical))
         where_conditions.append(resolved)
 
     where_sql = "\n      AND ".join(where_conditions)
@@ -571,7 +613,7 @@ def fetch_state_summary() -> pd.DataFrame:
 
 def fetch_lga_summary(state_name: str) -> pd.DataFrame:
     return read_sql_df(
-        build_union_summary_sql(["State", "Lga"], ["TRIM([State]) = TRIM(:state)"]),
+        build_union_summary_sql(["State", "Lga"], ["[State] = UPPER(TRIM(:state))"]),
         params={"state": state_name},
     )
 
@@ -580,7 +622,7 @@ def fetch_ward_summary(state_name: str, lga_name: str) -> pd.DataFrame:
     return read_sql_df(
         build_union_summary_sql(
             ["State", "Lga", "Ward"],
-            ["TRIM([State]) = TRIM(:state)", "TRIM([Lga]) = TRIM(:lga)"],
+            ["[State] = UPPER(TRIM(:state))", "[Lga] = UPPER(TRIM(:lga))"],
         ),
         params={"state": state_name, "lga": lga_name},
     )
@@ -591,9 +633,9 @@ def fetch_community_summary(state_name: str, lga_name: str, ward_name: str) -> p
         build_union_summary_sql(
             ["State", "Lga", "Ward", "Community"],
             [
-                "TRIM([State]) = TRIM(:state)",
-                "TRIM([Lga]) = TRIM(:lga)",
-                "TRIM([Ward]) = TRIM(:ward)",
+                "[State] = UPPER(TRIM(:state))",
+                "[Lga] = UPPER(TRIM(:lga))",
+                "[Ward] = UPPER(TRIM(:ward))",
             ],
         ),
         params={"state": state_name, "lga": lga_name, "ward": ward_name},
